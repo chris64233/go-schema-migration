@@ -116,19 +116,27 @@ func (s *Service) StartExecution(ctx context.Context, tenantID, planID, executio
 // ClaimStep 领取执行当前检查点处的步骤，取得租约令牌与递增尝试号。
 // 已有未过期租约（含已回执失败、仍在失败窗口内）时返回 ErrLeaseActive；
 // 租约过期或不存在才发放新租约。崩溃恢复后重新领取到的仍是同一个检查点步骤。
+//
+// 属于批次的执行还要先通过批次门控：批次未暂停、租户槽位在途且属于当前开启波次、
+// 本执行实例未被更新的尝试取代，否则拒绝领取（ErrBatchPaused / ErrWaveNotOpen 等）。
 func (s *Service) ClaimStep(ctx context.Context, executionID, workerID string, ttl time.Duration) (StepLease, error) {
 	if ttl <= 0 {
 		return StepLease{}, fmt.Errorf("%w: lease ttl must be positive", ErrInvalidPlan)
 	}
 	lease := StepLease{}
-	_, err := s.mutate(ctx, executionID, func(e *Execution) error {
+	saved, err := s.mutate(ctx, executionID, func(e *Execution) error {
 		switch e.State {
-		case StateSucceeded, StateRolledBack:
+		case StateSucceeded, StateRolledBack, StateAbandoned:
 			return ErrExecutionTerminal
 		case StatePaused:
 			return ErrExecutionPaused
 		case StateAwaitingCompat:
 			return ErrAwaitingCompatibility
+		}
+		if e.BatchID != "" {
+			if err := s.checkBatchGate(ctx, e); err != nil {
+				return err
+			}
 		}
 		now := s.now()
 		if e.Lease.Active(now) {
@@ -164,7 +172,35 @@ func (s *Service) ClaimStep(ctx context.Context, executionID, workerID string, t
 	if err != nil {
 		return StepLease{}, err
 	}
+	// 批次门控复查：执行 CAS 与批次 CAS 是两个独立的条件写。
+	// 若在发放租约的同一刻批次暂停/波次越过/租户被移出，立即吊销刚发的租约。
+	// 此时令牌尚未返回给调用方，不存在任何持有者，吊销等价于“从未发放”。
+	if saved.BatchID != "" {
+		if gateErr := s.checkBatchGate(ctx, &saved); gateErr != nil {
+			s.revokeFreshLease(ctx, saved.ID, lease.Token)
+			return StepLease{}, gateErr
+		}
+	}
 	return lease, nil
+}
+
+// revokeFreshLease 吊销一次尚未交付给工作者的新租约（批次门在发放后关闭时使用）。
+// 仅当租约令牌仍是发放的那一枚时才清除，避免误伤其他合法状态转移。
+func (s *Service) revokeFreshLease(ctx context.Context, executionID, token string) {
+	_, _ = s.mutate(ctx, executionID, func(e *Execution) error {
+		if e.Lease.Token != token {
+			return nil
+		}
+		e.Lease = Lease{}
+		e.StepInFlight = false
+		// 回到无租约的可领取态，批次恢复/波次开放后可重新领取同一检查点步骤。
+		if e.State == StateRunning {
+			e.State = StateRunning
+		} else if e.State == StateRollingBack {
+			e.State = StateRollingBack
+		}
+		return nil
+	})
 }
 
 // ReportResult 提交步骤回执。成功或失败回执都必须携带与当前租约一致的令牌
@@ -172,8 +208,9 @@ func (s *Service) ClaimStep(ctx context.Context, executionID, workerID string, t
 //
 // 成功回执推进检查点（正向可能转入等待兼容确认或成功终态，逆向可能转入回滚完成）；
 // 失败回执把执行置为 Failed 并保留租约至过期，过期后下一次领取获得新尝试号。
+// 属于批次的执行在回执落盘后会同步批次槽位并评估波次推进/自动暂停。
 func (s *Service) ReportResult(ctx context.Context, executionID, token string, attempt int, success bool, errMsg string) (Execution, error) {
-	return s.mutate(ctx, executionID, func(e *Execution) error {
+	exec, err := s.mutate(ctx, executionID, func(e *Execution) error {
 		if e.State.IsTerminal() {
 			return ErrExecutionTerminal
 		}
@@ -236,14 +273,20 @@ func (s *Service) ReportResult(ctx context.Context, executionID, token string, a
 		}
 		return nil
 	})
+	if err != nil {
+		return Execution{}, err
+	}
+	s.reconcileReceipt(ctx, exec, "step receipt")
+	return exec, nil
 }
 
 // ConfirmCompatibility 由指定应用实例提交兼容确认。只有冻结集合内的实例、
 // 且执行正处于兼容等待状态时才被接受；迟到确认（流程已继续或已回滚）返回
 // ErrNotAwaitingCompatibility，集合外实例返回 ErrUnknownInstance，重复确认幂等。
 // 当冻结集合全部确认后流程自动推进（继续下一步或进入成功终态）。
+// 属于批次的执行在门槛达成并推进后同样会同步批次槽位与波次评估。
 func (s *Service) ConfirmCompatibility(ctx context.Context, executionID, instanceID string) (Execution, error) {
-	return s.mutate(ctx, executionID, func(e *Execution) error {
+	exec, err := s.mutate(ctx, executionID, func(e *Execution) error {
 		if e.State != StateAwaitingCompat {
 			return fmt.Errorf("%w: execution %s state %s", ErrNotAwaitingCompatibility, executionID, e.State)
 		}
@@ -278,6 +321,13 @@ func (s *Service) ConfirmCompatibility(ctx context.Context, executionID, instanc
 		}
 		return nil
 	})
+	if err != nil {
+		return Execution{}, err
+	}
+	if exec.State == StateRunning || exec.State == StateSucceeded {
+		s.reconcileReceipt(ctx, exec, "compatibility gate passed")
+	}
+	return exec, nil
 }
 
 // Pause 暂停执行并使当前租约失效（持有者之后的回执会被拒绝）。

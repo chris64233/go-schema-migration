@@ -23,11 +23,14 @@ const (
 	StateFailed State = "failed"
 	// StateRolledBack 回滚完成，终态。
 	StateRolledBack State = "rolled_back"
+	// StateAbandoned 本次尝试被批次编排废弃（租户重试/移出时终结旧尝试），终态。
+	// 废弃只关闭尝试记录：CurrentStep 检查点保持原样，代表的已落库数据库版本不被回写。
+	StateAbandoned State = "abandoned"
 )
 
 // IsTerminal 判断状态是否为终态。
 func (s State) IsTerminal() bool {
-	return s == StateSucceeded || s == StateRolledBack
+	return s == StateSucceeded || s == StateRolledBack || s == StateAbandoned
 }
 
 // Direction 表示当前推进方向。
@@ -114,6 +117,11 @@ type Execution struct {
 
 	// LastError 最近一次失败回执的原因，便于排查。
 	LastError string `json:"last_error,omitempty"`
+
+	// BatchID 非空时表示该执行由迁移批次创建，用于审计与批次门控反查。
+	BatchID string `json:"batch_id,omitempty"`
+	// BatchAttempt 租户在批次内的尝试序号（首次为 1，重试递增）。
+	BatchAttempt int `json:"batch_attempt,omitempty"`
 
 	// Revision 乐观锁版本号，由存储层维护，调用方不要修改。
 	Revision int64 `json:"revision"`

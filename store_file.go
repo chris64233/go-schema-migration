@@ -11,9 +11,10 @@ import (
 
 // fileData 是文件存储的落盘结构。
 type fileData struct {
-	Plans  map[string]Plan      `json:"plans"`
-	Execs  map[string]Execution `json:"execs"`
-	Active map[string]string    `json:"active"`
+	Plans   map[string]Plan      `json:"plans"`
+	Execs   map[string]Execution `json:"execs"`
+	Active  map[string]string    `json:"active"`
+	Batches map[string]Batch     `json:"batches"`
 }
 
 // fileStore 把全部状态以 JSON 形式原子写入单个文件（临时文件 + rename）。
@@ -30,9 +31,10 @@ func NewFileStore(path string) (Store, error) {
 	s := &fileStore{
 		path: path,
 		data: fileData{
-			Plans:  make(map[string]Plan),
-			Execs:  make(map[string]Execution),
-			Active: make(map[string]string),
+			Plans:   make(map[string]Plan),
+			Execs:   make(map[string]Execution),
+			Active:  make(map[string]string),
+			Batches: make(map[string]Batch),
 		},
 	}
 	raw, err := os.ReadFile(path)
@@ -51,6 +53,9 @@ func NewFileStore(path string) (Store, error) {
 		}
 		if s.data.Active == nil {
 			s.data.Active = make(map[string]string)
+		}
+		if s.data.Batches == nil {
+			s.data.Batches = make(map[string]Batch)
 		}
 	case errors.Is(err, os.ErrNotExist):
 		if err := s.persistLocked(); err != nil {
@@ -168,4 +173,43 @@ func (s *fileStore) UpdateExecution(_ context.Context, exec Execution, expectRev
 		return Execution{}, err
 	}
 	return cloneExecution(exec), nil
+}
+
+func (s *fileStore) CreateBatch(_ context.Context, batch Batch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.data.Batches[batch.ID]; ok {
+		return ErrAlreadyExists
+	}
+	batch.Revision = 1
+	s.data.Batches[batch.ID] = cloneBatch(batch)
+	return s.persistLocked()
+}
+
+func (s *fileStore) GetBatch(_ context.Context, id string) (Batch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batch, ok := s.data.Batches[id]
+	if !ok {
+		return Batch{}, ErrBatchNotFound
+	}
+	return cloneBatch(batch), nil
+}
+
+func (s *fileStore) UpdateBatch(_ context.Context, batch Batch, expectRevision int64) (Batch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.data.Batches[batch.ID]
+	if !ok {
+		return Batch{}, ErrBatchNotFound
+	}
+	if cur.Revision != expectRevision {
+		return Batch{}, ErrConflict
+	}
+	batch.Revision = cur.Revision + 1
+	s.data.Batches[batch.ID] = cloneBatch(batch)
+	if err := s.persistLocked(); err != nil {
+		return Batch{}, err
+	}
+	return cloneBatch(batch), nil
 }

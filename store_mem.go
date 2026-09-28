@@ -29,22 +29,31 @@ type Store interface {
 	// UpdateExecution 仅当持久化记录的 revision 等于 expectRevision 时生效，
 	// 成功后记录 revision 自增。终态执行必须原子地释放租户活跃指针。
 	UpdateExecution(ctx context.Context, exec Execution, expectRevision int64) (Execution, error)
+
+	// ---- 批次（BatchStore）----
+	// CreateBatch 批次 ID 不存在时才能创建。
+	CreateBatch(ctx context.Context, batch Batch) error
+	GetBatch(ctx context.Context, id string) (Batch, error)
+	// UpdateBatch 仅当持久化记录的 revision 等于 expectRevision 时生效，成功后自增。
+	UpdateBatch(ctx context.Context, batch Batch, expectRevision int64) (Batch, error)
 }
 
 // memStore 是进程内、并发安全的 Store 实现，主要用于测试与单进程部署。
 type memStore struct {
-	mu     sync.Mutex
-	plans  map[string]Plan
-	execs  map[string]Execution
-	active map[string]string // tenantID -> executionID（仅活跃执行）
+	mu      sync.Mutex
+	plans   map[string]Plan
+	execs   map[string]Execution
+	active  map[string]string // tenantID -> executionID（仅活跃执行）
+	batches map[string]Batch
 }
 
 // NewMemoryStore 返回一个进程内持久化实现。
 func NewMemoryStore() Store {
 	return &memStore{
-		plans:  make(map[string]Plan),
-		execs:  make(map[string]Execution),
-		active: make(map[string]string),
+		plans:   make(map[string]Plan),
+		execs:   make(map[string]Execution),
+		active:  make(map[string]string),
+		batches: make(map[string]Batch),
 	}
 }
 
@@ -128,6 +137,42 @@ func (s *memStore) UpdateExecution(_ context.Context, exec Execution, expectRevi
 	return cloneExecution(exec), nil
 }
 
+func (s *memStore) CreateBatch(_ context.Context, batch Batch) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.batches[batch.ID]; ok {
+		return ErrAlreadyExists
+	}
+	batch.Revision = 1
+	s.batches[batch.ID] = cloneBatch(batch)
+	return nil
+}
+
+func (s *memStore) GetBatch(_ context.Context, id string) (Batch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	batch, ok := s.batches[id]
+	if !ok {
+		return Batch{}, ErrBatchNotFound
+	}
+	return cloneBatch(batch), nil
+}
+
+func (s *memStore) UpdateBatch(_ context.Context, batch Batch, expectRevision int64) (Batch, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.batches[batch.ID]
+	if !ok {
+		return Batch{}, ErrBatchNotFound
+	}
+	if cur.Revision != expectRevision {
+		return Batch{}, ErrConflict
+	}
+	batch.Revision = cur.Revision + 1
+	s.batches[batch.ID] = cloneBatch(batch)
+	return cloneBatch(batch), nil
+}
+
 func clonePlan(p Plan) Plan {
 	out := Plan{ID: p.ID, Steps: make([]Step, len(p.Steps))}
 	for i, st := range p.Steps {
@@ -169,6 +214,34 @@ func cloneBoolSet(m map[string]bool) map[string]bool {
 	out := make(map[string]bool, len(m))
 	for k := range m {
 		out[k] = true
+	}
+	return out
+}
+
+func cloneBatch(b Batch) Batch {
+	out := b
+	out.TenantIDs = append([]string(nil), b.TenantIDs...)
+	out.FrozenInstances = append([]string(nil), b.FrozenInstances...)
+	if b.Waves != nil {
+		out.Waves = make([][]string, len(b.Waves))
+		for i, w := range b.Waves {
+			out.Waves[i] = append([]string(nil), w...)
+		}
+	}
+	if b.Tenants != nil {
+		out.Tenants = make(map[string]*BatchTenant, len(b.Tenants))
+		for k, v := range b.Tenants {
+			cp := *v
+			out.Tenants[k] = &cp
+		}
+	}
+	if b.Events != nil {
+		out.Events = make([]BatchEvent, len(b.Events))
+		for i, ev := range b.Events {
+			cp := ev
+			cp.Waves = append([]WaveSnapshot(nil), ev.Waves...)
+			out.Events[i] = cp
+		}
 	}
 	return out
 }

@@ -44,4 +44,27 @@ var (
 	ErrInvalidRollbackTarget = errors.New("invalid rollback target version")
 	// ErrIrreversibleBarrier 目标版本之下存在已经成功的、不可回滚步骤。
 	ErrIrreversibleBarrier = errors.New("cannot roll back past an irreversible step")
+
+	// ---- 批次 / 波次 ----
+
+	// ErrBatchNotFound 批次不存在。
+	ErrBatchNotFound = errors.New("batch not found")
+	// ErrBatchTerminal 批次已处于终态（completed/aborted），不能再执行该操作。
+	ErrBatchTerminal = errors.New("batch is terminal")
+	// ErrBatchNotPaused 恢复/重试等操作要求批次处于暂停态。
+	ErrBatchNotPaused = errors.New("batch is not paused")
+	// ErrBatchPaused 批次暂停期间不能开启波次/推进租户。
+	ErrBatchPaused = errors.New("batch is paused")
+	// ErrInvalidBatch 批次参数不合法（空租户、波次数非法、门槛非法等）。
+	ErrInvalidBatch = errors.New("invalid batch")
+	// ErrTenantNotInBatch 租户不属于该批次。
+	ErrTenantNotInBatch = errors.New("tenant is not a member of the batch")
+	// ErrTenantNotFailed 重试只允许针对当前明确失败的租户。
+	ErrTenantNotFailed = errors.New("tenant is not in failed state")
+	// ErrTenantAlreadyRemoved 租户已被移出批次。
+	ErrTenantAlreadyRemoved = errors.New("tenant already removed from batch")
+	// ErrWaveNotOpen 租户所属波次不是当前开启波次，不能领取步骤。
+	ErrWaveNotOpen = errors.New("tenant wave is not open")
+	// ErrThresholdExceeded 失败数/失败率已超过批次冻结的暂停门槛。
+	ErrThresholdExceeded = errors.New("failure threshold exceeded")
 )
