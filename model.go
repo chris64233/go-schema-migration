@@ -86,6 +86,11 @@ type Execution struct {
 	State     State     `json:"state"`
 	Direction Direction `json:"direction"`
 
+	// BatchID 非空时表示该执行由迁移批次在波次开启时创建，领取步骤时必须
+	// 通过批次闸门（批次处于 running 且该租户位于当前波次）。为空表示独立执行。
+	// 操作员把租户移出批次时只清空该字段，执行状态/检查点/已完成版本均不变。
+	BatchID string `json:"batch_id,omitempty"`
+
 	// PlanSteps 是计划步骤在创建执行时冻结下来的副本；计划后续若被替换
 	// （同 ID 重发布将直接被拒绝），也不影响在途执行。
 	PlanSteps []Step `json:"plan_steps"`

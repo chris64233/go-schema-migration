@@ -1,8 +1,9 @@
 # go-schema-migration
 
 多租户数据库结构迁移的**分阶段编排**库。负责计划发布、租户执行编排、工作者步骤领取与回执、
-应用兼容确认、暂停/恢复/回滚与状态查询；自身无状态，所有状态通过 `Store` 持久化，
-可多副本部署、崩溃后从检查点恢复。
+应用兼容确认、暂停/恢复/回滚与状态查询；并在单租户执行之上提供**多租户分波次迁移（Batch）**：
+冻结租户集合与波次顺序、波次闸门、失败率自动暂停、失败租户重试/移出与完整审计。
+自身无状态，所有状态通过 `Store` 持久化，可多副本部署、崩溃后从检查点恢复。
 
 开发环境：Go 1.23.0，无第三方依赖。
 
@@ -83,6 +84,71 @@ go test -race ./...   # 含并发状态机竞态检测
 - 发起回滚立即作废当前正向租约，在途正向回执之后会被拒绝（`ErrNoActiveLease`）。
 - 回滚完成进入终态 `rolled_back`；暂停/恢复在回滚中同样可用。
 
+## 多租户分波次迁移（Batch）
+
+在单租户执行之上，`Batch` 把一组租户按固定规则分成多个**波次（Wave）**灰度推进，
+并以允许失败数（失败率门槛）控制是否暂停。
+
+### 创建即冻结
+
+`CreateBatch(CreateBatchOptions{ID, PlanID, TenantIDs, WaveSize, MaxFailures, Instances})`：
+
+- **租户集合冻结**：入参租户经**排序去重**后冻结；批次不提供任何“新增租户”入口，
+  因此之后出现的新租户绝不会自动进入正在执行的批次。
+- **波次顺序冻结**：按排序后顺序每 `WaveSize` 个租户一波（第 0 波取前 N 个，依此类推），
+  波次顺序即切片下标，创建后不再变化。
+- **门槛冻结**：`MaxFailures`（允许的失败租户数）与应用实例部署集合在创建时冻结；
+  缺少计划门槛要求的实例会创建失败。
+- 创建后立即开启**第 0 波**并为该波每个租户创建一个带 `BatchID` 的执行实例
+  （执行 ID 由批次与租户确定性派生）。其余波次租户处于 `pending`，执行尚未创建。
+
+### 波次闸门与并行
+
+- 同一波次内的多个租户**可以并行**领取、执行、回执。
+- **只有当前波全部租户都进入成功或明确失败（或被移出）后，才会评估下一波**；
+  波次未结算时，后续波次的租户连执行都不存在，无法领取（领取返回 `ErrExecutionNotFound`；
+  闸门对已存在执行额外以 `ErrWaveNotOpen` 拦截）。
+- 波次开启决定在批次 `revision` 的 CAS 临界区内做出，**每个波次恰好开启一次**，
+  并发回执/收敛不会重复开波。
+
+### 失败门槛与自动暂停
+
+- 每次步骤回执或兼容确认后都幂等地触发一次批次收敛（`reconcile`）：按执行真实状态
+  结算租户成败，并在同一次 CAS 评估门槛与波次推进。
+- 当未移出的失败租户数**严格大于 `MaxFailures`** 时，批次**自动暂停**（`paused`）：
+  - 尚未开始的租户**不得领取步骤**（批次闸门返回 `ErrBatchPaused`）；
+  - **已领取（在途）的租约按既有租约规则照常收敛**——成功/失败回执仍被接受并结算，
+    批次不会回滚它们；
+  - 不会再开启下一波。
+- 最后一波结算后若仍有未处理失败（即使在阈值内），批次也会暂停等待人工处理，
+  失败清零后才能完成。
+
+### 人工处理：重试与移出
+
+| 操作 | 语义 |
+| --- | --- |
+| `RetryTenant(batch, tenant, reason)` | 让失败待处理租户**从最后有效检查点继续**：复用同一执行（`CurrentStep` 不回退），作废旧租约令牌、保留并递增尝试号；**旧租约/旧批次回执无法推进新尝试**。回滚终态（`rolled_back`）不能重试。重试不自动恢复批次，仍需 `ResumeBatch`。 |
+| `RemoveTenant(batch, tenant, reason)` | 把失败租户**移出**当前批次：该租户据此视为已结算，波次可继续评估；**只做解耦（清执行的 `BatchID`），不回写、不删除已完成的数据库版本与检查点**，执行之后作为独立执行继续存在。 |
+| `PauseBatch` / `ResumeBatch(batch, reason)` | 人工暂停/恢复。暂停后所有新领取被拦截、在途租约照常收敛；恢复时若失败数仍超阈值会被门槛立即重新判停。 |
+
+所有人工操作与自动决定都**必须带原因（reason）**，并连同当时的统计快照写入批次审计日志。
+
+### 审计与查询
+
+所有波次决定（`wave_started`/`wave_completed`/`auto_paused`/`completed`）与人工处理
+（`paused`/`resumed`/`tenant_retried`/`tenant_removed`）都追加一条不可变 `BatchEvent`，
+含序号、时间、类型、原因、波次、租户与**当时统计快照**。查询接口：
+
+- `GetBatch` / `ListBatchEvents`：批次聚合与审计流水；
+- `ListWaves`：每个波次的开启/完成状态、固定租户列表与波内统计；
+- `ListTenantExecutions` / `GetTenantExecution`：租户执行视图（批次槽位状态 + 执行检查点/版本）；
+- `ListFailureReasons`：当前失败待处理租户及失败原因；
+- `GetCurrentGate`：当前门槛（状态、当前波、`MaxFailures`、实时统计、剩余可容忍失败数）；
+- `SweepBatch`：离线/兜底收敛，补建缺失执行、补开满足条件的下一波（幂等，可安全重复调用）。
+
+批次状态：`active`（推进中）、`paused`（自动或人工暂停）、`completed`（全部波次结束且无未处理失败）。
+租户槽位状态：`pending`、`running`、`succeeded`、`failed`、`removed`。
+
 ## 快速开始
 
 ```go
@@ -152,6 +218,39 @@ svc.GetActiveExecution(ctx, tenantID)  // 查询租户当前活跃执行
 svc.GetPlan(ctx, planID)               // 查询已发布计划
 ```
 
+多租户分波次迁移：
+
+```go
+// 6 个租户按排序每 2 个一波（共 3 波），允许 1 个失败租户（第 2 个失败即自动暂停）。
+batch, err := svc.CreateBatch(ctx, schemamigration.CreateBatchOptions{
+    ID:          "batch-2026-09",
+    PlanID:      plan.ID,
+    TenantIDs:   []string{"t-3", "t-1", "t-2", "t-4", "t-5", "t-6"}, // 会被排序去重冻结
+    WaveSize:    2,
+    MaxFailures: 1,
+    Instances:   []string{"app-a", "app-b", "app-canary"},           // 兼容门槛实例快照
+})
+if err != nil {
+    panic(err)
+}
+
+// 工作者用“批次:租户”派生的执行 ID 领取当前波租户的步骤（并行）。
+execID := "batch-2026-09:t-1"
+lease, err := svc.ClaimStep(ctx, execID, "worker-1", 30*time.Second)
+// ... 执行 DDL 并 ReportResult；每次回执后服务自动结算波次/评估门槛/开启下一波。
+
+// 失败超阈值自动暂停后，操作员处理失败租户，再恢复。
+svc.RetryTenant(ctx, batch.ID, "t-1", "transient DDL timeout, retry from checkpoint")
+// 或：svc.RemoveTenant(ctx, batch.ID, "t-1", "excluded; do not rewrite its version")
+svc.ResumeBatch(ctx, batch.ID, "failures handled, continue rollout")
+
+gate, _ := svc.GetCurrentGate(ctx, batch.ID)        // 当前状态/当前波/阈值/实时统计
+waves, _ := svc.ListWaves(ctx, batch.ID)            // 各波次状态与波内统计
+fails, _ := svc.ListFailureReasons(ctx, batch.ID)   // 失败租户与原因
+events, _ := svc.ListBatchEvents(ctx, batch.ID)     // 含原因与统计快照的审计流水
+_, _ = gate, waves; _, _ = fails, events
+```
+
 ## 持久化
 
 | 构造 | 说明 |
@@ -160,8 +259,10 @@ svc.GetPlan(ctx, planID)               // 查询已发布计划
 | `NewFileStore(path)` | 全量 JSON 原子落盘（临时文件 + `rename`），每次条件写后 fsync，崩溃后重开即恢复，适合嵌入式/单实例场景 |
 
 需要数据库持久化时实现 `schemamigration.Store` 接口即可（计划条件创建、
-租户活跃执行唯一约束、执行按 `revision` 的 CAS 条件更新；终态写必须原子释放活跃指针）。
-`Service` 无状态，存储层的条件写是并发安全的唯一支点。
+租户活跃执行唯一约束、执行按 `revision` 的 CAS 条件更新；终态写必须原子释放活跃指针；
+批次条件创建、批次按 `revision` 的 CAS 条件更新、按 `BatchID` 列出执行）。
+`Service` 无状态，存储层的条件写是并发安全的唯一支点；批次波次开启的“恰好一次”
+同样依赖批次 `revision` CAS。
 
 ## 错误速查
 
@@ -178,12 +279,18 @@ svc.GetPlan(ctx, planID)               // 查询已发布计划
 | `ErrNotAwaitingCompatibility` | 非等待状态的（迟到）确认 |
 | `ErrUnknownInstance` | 确认方不在当前门槛的冻结实例列表内 |
 | `ErrInvalidRollbackTarget` / `ErrIrreversibleBarrier` | 目标版本未到达 / 跨越不可逆步骤 |
+| `ErrInvalidBatch` | 批次定义非法（ID/计划/波次大小/阈值/租户/实例缺失等），或人工操作缺少原因 |
+| `ErrBatchNotFound` / `ErrTenantNotInBatch` | 批次不存在 / 租户不属于该批次 |
+| `ErrBatchPaused` / `ErrWaveNotOpen` | 批次暂停中领取 / 租户所属波次尚未开启 |
+| `ErrBatchAlreadyPaused` / `ErrBatchNotActive` / `ErrBatchCompleted` | 重复暂停 / 恢复非暂停批次 / 在已完成批次上操作 |
+| `ErrTenantFailed` / `ErrTenantNotFailed` / `ErrTenantRemoved` | 失败租户未重试自行领取 / 对非失败租户重试 / 操作已移出租户 |
 
 所有错误均为包级哨兵错误，使用 `errors.Is` 判断。
 
 ## 测试覆盖
 
-`service_test.go` 以可注入时钟和内存/文件两种存储覆盖：
+`service_test.go`（单租户）与 `batch_test.go`（多租户分波次）以可注入时钟和内存/文件
+两种存储覆盖：
 
 - 计划校验、发布后不可变、重复发布幂等；
 - 租户单活跃执行、创建时实例集合冻结；
@@ -193,3 +300,16 @@ svc.GetPlan(ctx, planID)               // 查询已发布计划
 - 暂停/恢复与回执并发、回滚作废在途正向租约、回滚中跨不可逆屏障拒绝；
 - 基于文件存储的崩溃恢复：重启后从最后检查点继续，不重复、不跳步；
 - 20 路并发同租约回执恰好推进一次、暂停/恢复/回滚/领取/回执混合并发下状态与检查点始终合法。
+
+批次（`batch_test.go`）：
+
+- 创建即冻结：租户排序去重、固定分波顺序、门槛/实例快照冻结、无新增租户入口、非法输入；
+- 波次顺序推进：同波并行、未开波不能领取、整波结算才开下一波、全部成功才完成；
+- 失败门槛：边界值（`Failed > MaxFailures` 才暂停）、超阈值自动暂停、暂停后未开始租户
+  不得领取、在途租约照常回执收敛、恢复时仍超阈值被重新判停；
+- 重试：从最后检查点继续、尝试号递增、旧租约旧回执无法推进、非失败/回滚终态拒绝重试；
+- 移出：只解耦批次不回写已完成版本与检查点、波次据此结算继续；
+- 回滚终态结算为失败、人工暂停/恢复、所有人工操作必须带原因；
+- 查询：波次视图/租户执行视图/失败原因/当前门槛统计，审计事件含原因与统计快照；
+- 并发：成功回执与收敛并发下波次**恰好开启一次**、暂停/恢复/领取/回执/Sweep 混合并发下
+  状态唯一且波次不重复开启；文件存储崩溃恢复后 `Sweep` 幂等补开、不重复开波。

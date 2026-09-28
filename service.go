@@ -58,25 +58,37 @@ func (s *Service) PublishPlan(ctx context.Context, plan Plan) error {
 	return err
 }
 
-// StartExecution 为租户创建一个执行实例，并冻结计划步骤副本与兼容确认实例集合。
-// instances 是创建时刻该计划所需门槛实例的部署集合；缺少任一被门槛要求的实例会失败。
-// 一个租户同一时刻只能有一个未终结的执行实例。
+// StartExecution 为租户创建一个独立执行实例（不属于任何批次），并冻结计划步骤
+// 副本与兼容确认实例集合。instances 是创建时刻该计划所需门槛实例的部署集合；
+// 缺少任一被门槛要求的实例会失败。一个租户同一时刻只能有一个未终结的执行实例。
 func (s *Service) StartExecution(ctx context.Context, tenantID, planID, executionID string, instances []string) (Execution, error) {
+	_, exec, err := s.prepareExecution(ctx, tenantID, planID, executionID, instances)
+	if err != nil {
+		return Execution{}, err
+	}
+	if err := s.store.CreateExecution(ctx, exec); err != nil {
+		return Execution{}, err
+	}
+	return s.store.GetExecution(ctx, executionID)
+}
+
+// prepareExecution 校验输入并构造一个尚未持久化的执行实例（冻结计划与实例快照）。
+func (s *Service) prepareExecution(ctx context.Context, tenantID, planID, executionID string, instances []string) (Plan, Execution, error) {
 	if tenantID == "" || planID == "" || executionID == "" {
-		return Execution{}, fmt.Errorf("%w: tenant, plan and execution id are required", ErrInvalidPlan)
+		return Plan{}, Execution{}, fmt.Errorf("%w: tenant, plan and execution id are required", ErrInvalidPlan)
 	}
 	plan, err := s.store.GetPlan(ctx, planID)
 	if err != nil {
-		return Execution{}, err
+		return Plan{}, Execution{}, err
 	}
 
 	deployed := make(map[string]bool, len(instances))
 	for _, ins := range instances {
 		if ins == "" {
-			return Execution{}, fmt.Errorf("%w: instance id must not be empty", ErrInvalidPlan)
+			return Plan{}, Execution{}, fmt.Errorf("%w: instance id must not be empty", ErrInvalidPlan)
 		}
 		if deployed[ins] {
-			return Execution{}, fmt.Errorf("%w: duplicate instance %q", ErrInvalidPlan, ins)
+			return Plan{}, Execution{}, fmt.Errorf("%w: duplicate instance %q", ErrInvalidPlan, ins)
 		}
 		deployed[ins] = true
 	}
@@ -88,7 +100,7 @@ func (s *Service) StartExecution(ctx context.Context, tenantID, planID, executio
 		}
 		for _, ins := range step.RequireCompatibility.RequiredInstances {
 			if !deployed[ins] {
-				return Execution{}, fmt.Errorf("%w: required instance %q not present at execution creation", ErrInvalidPlan, ins)
+				return Plan{}, Execution{}, fmt.Errorf("%w: required instance %q not present at execution creation", ErrInvalidPlan, ins)
 			}
 			frozen[ins] = true
 		}
@@ -107,10 +119,7 @@ func (s *Service) StartExecution(ctx context.Context, tenantID, planID, executio
 		CreatedAt:       now,
 		UpdatedAt:       now,
 	}
-	if err := s.store.CreateExecution(ctx, exec); err != nil {
-		return Execution{}, err
-	}
-	return s.store.GetExecution(ctx, executionID)
+	return plan, exec, nil
 }
 
 // ClaimStep 领取执行当前检查点处的步骤，取得租约令牌与递增尝试号。
@@ -134,6 +143,14 @@ func (s *Service) ClaimStep(ctx context.Context, executionID, workerID string, t
 		if e.Lease.Active(now) {
 			// 既包括正常进行中的租约，也包括已失败、仍在失败窗口内的租约。
 			return ErrLeaseActive
+		}
+		// 批次执行：只有批次推进中、租户属于当前已开启波次且未被判定失败/移出
+		// 时才能领取。批次暂停或波次未开启都会拦截，保证“尚未开始的租户不得
+		// 领取步骤”，也保证失败租户在人工重试前不会自行重新领取。
+		if e.BatchID != "" {
+			if err := s.checkBatchClaimGate(ctx, e); err != nil {
+				return err
+			}
 		}
 		step, ok := e.currentStepDef()
 		if !ok { // 理论不可达：终态已在上面拦截。
@@ -173,7 +190,7 @@ func (s *Service) ClaimStep(ctx context.Context, executionID, workerID string, t
 // 成功回执推进检查点（正向可能转入等待兼容确认或成功终态，逆向可能转入回滚完成）；
 // 失败回执把执行置为 Failed 并保留租约至过期，过期后下一次领取获得新尝试号。
 func (s *Service) ReportResult(ctx context.Context, executionID, token string, attempt int, success bool, errMsg string) (Execution, error) {
-	return s.mutate(ctx, executionID, func(e *Execution) error {
+	exec, err := s.mutate(ctx, executionID, func(e *Execution) error {
 		if e.State.IsTerminal() {
 			return ErrExecutionTerminal
 		}
@@ -236,6 +253,17 @@ func (s *Service) ReportResult(ctx context.Context, executionID, token string, a
 		}
 		return nil
 	})
+	if err != nil {
+		return Execution{}, err
+	}
+	// 回执可能让租户成功/失败，触发波次结算、阈值自动暂停或下一波开启。
+	if exec.BatchID != "" {
+		if rerr := s.reconcileBatch(ctx, exec.BatchID); rerr != nil {
+			return Execution{}, rerr
+		}
+		return s.store.GetExecution(ctx, executionID)
+	}
+	return exec, nil
 }
 
 // ConfirmCompatibility 由指定应用实例提交兼容确认。只有冻结集合内的实例、
@@ -243,7 +271,7 @@ func (s *Service) ReportResult(ctx context.Context, executionID, token string, a
 // ErrNotAwaitingCompatibility，集合外实例返回 ErrUnknownInstance，重复确认幂等。
 // 当冻结集合全部确认后流程自动推进（继续下一步或进入成功终态）。
 func (s *Service) ConfirmCompatibility(ctx context.Context, executionID, instanceID string) (Execution, error) {
-	return s.mutate(ctx, executionID, func(e *Execution) error {
+	exec, err := s.mutate(ctx, executionID, func(e *Execution) error {
 		if e.State != StateAwaitingCompat {
 			return fmt.Errorf("%w: execution %s state %s", ErrNotAwaitingCompatibility, executionID, e.State)
 		}
@@ -278,6 +306,17 @@ func (s *Service) ConfirmCompatibility(ctx context.Context, executionID, instanc
 		}
 		return nil
 	})
+	if err != nil {
+		return Execution{}, err
+	}
+	// 最后一道门达成会让租户进入成功终态，触发批次结算与波次推进。
+	if exec.BatchID != "" {
+		if rerr := s.reconcileBatch(ctx, exec.BatchID); rerr != nil {
+			return Execution{}, rerr
+		}
+		return s.store.GetExecution(ctx, executionID)
+	}
+	return exec, nil
 }
 
 // Pause 暂停执行并使当前租约失效（持有者之后的回执会被拒绝）。
