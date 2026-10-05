@@ -69,6 +69,18 @@ var (
 	ErrTenantNotFailed = errors.New("tenant is not in a failed state")
 	// ErrTenantFailed 租户已失败待人工处理，未重试前不能自行领取步骤。
 	ErrTenantFailed = errors.New("tenant is awaiting retry or removal")
+	// ErrTenantBlocked 租户已因前置失败被依赖闸门阻断，不能领取步骤，
+	// 旧观察/旧回执也不能把它重新标记为可运行。
+	ErrTenantBlocked = errors.New("tenant is blocked by dependency gate")
+	// ErrTenantNotSucceeded 观察结论只能针对执行已成功结算的租户给出。
+	ErrTenantNotSucceeded = errors.New("tenant has not succeeded")
+	// ErrObservationConcluded 租户已有观察结论；观察是一次性的，迟到观察
+	// （无论通过与否）不能覆盖既有结论或解除已经发生的依赖阻断。
+	ErrObservationConcluded = errors.New("tenant observation already concluded")
+	// ErrDependencyCycle 创建批次声明的租户依赖图成环。
+	ErrDependencyCycle = errors.New("tenant dependency graph contains a cycle")
+	// ErrDependencyUnknown 依赖引用了不属于同一批次的租户。
+	ErrDependencyUnknown = errors.New("dependency references tenant not in batch")
 	// ErrBatchFailureThreshold 失败租户数已超过允许阈值，批次自动暂停。
 	ErrBatchFailureThreshold = errors.New("batch failure threshold exceeded")
 )
