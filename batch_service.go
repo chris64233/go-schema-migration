@@ -26,6 +26,11 @@ type CreateBatchOptions struct {
 	// Instances 创建时刻的应用实例部署集合，被冻结进批次并用于各租户执行
 	// 的兼容门槛校验（语义与 StartExecution 的 instances 相同）。
 	Instances []string
+	// Dependencies 声明租户依赖关系（可空）。依赖图在创建时校验并冻结：
+	// 前置租户必须属于同一批次、不能成环，且不得位于比依赖者更晚的波次。
+	// 依赖者只有在全部前置租户达到允许的完成状态（succeeded 或被显式移出）
+	// 后，才具备进入其原波次的资格；在此之前领取步骤返回 ErrDependencyNotSatisfied。
+	Dependencies []TenantDependency
 }
 
 // CreateBatch 创建迁移批次：冻结租户集合、波次顺序、允许失败数与暂停条件，
@@ -109,6 +114,11 @@ func (s *Service) CreateBatch(ctx context.Context, opts CreateBatchOptions) (Bat
 		}
 	}
 
+	// 校验并冻结依赖图（需要分波结果以拒绝指向更晚波次的依赖）。
+	if err := freezeDependencies(btMap, opts.Dependencies); err != nil {
+		return Batch{}, err
+	}
+
 	now := s.now()
 	batch := Batch{
 		ID:              opts.ID,
@@ -156,6 +166,82 @@ func (s *Service) PauseBatch(ctx context.Context, batchID, reason string) (Batch
 		return Batch{}, err
 	}
 	return s.store.GetBatch(ctx, batchID)
+}
+
+// freezeDependencies 校验依赖声明并把它冻结进各租户槽位。
+// 校验规则：前置必须属于同一批次、不允许自依赖/重复前置/重复条目、
+// 前置不得位于更晚的波次（否则永远无法满足），且依赖图不能成环。
+func freezeDependencies(tenants map[string]*BatchTenant, deps []TenantDependency) error {
+	adj := make(map[string][]string, len(deps))
+	for _, d := range deps {
+		bt, ok := tenants[d.TenantID]
+		if !ok {
+			return fmt.Errorf("%w: tenant %q is not in the batch", ErrInvalidDependency, d.TenantID)
+		}
+		if _, dup := adj[d.TenantID]; dup {
+			return fmt.Errorf("%w: duplicate dependency entry for tenant %q", ErrInvalidDependency, d.TenantID)
+		}
+		if len(d.DependsOn) == 0 {
+			return fmt.Errorf("%w: dependency entry for tenant %q has no prerequisites", ErrInvalidDependency, d.TenantID)
+		}
+		seen := make(map[string]bool, len(d.DependsOn))
+		prereqs := make([]string, 0, len(d.DependsOn))
+		for _, p := range d.DependsOn {
+			pre, ok := tenants[p]
+			if !ok {
+				return fmt.Errorf("%w: prerequisite %q of tenant %q is not in the batch", ErrInvalidDependency, p, d.TenantID)
+			}
+			if p == d.TenantID {
+				return fmt.Errorf("%w: tenant %q depends on itself", ErrInvalidDependency, p)
+			}
+			if seen[p] {
+				return fmt.Errorf("%w: tenant %q lists prerequisite %q more than once", ErrInvalidDependency, d.TenantID, p)
+			}
+			seen[p] = true
+			if pre.WaveIndex > bt.WaveIndex {
+				return fmt.Errorf("%w: prerequisite %q is in later wave %d than tenant %q (wave %d)",
+					ErrInvalidDependency, p, pre.WaveIndex, d.TenantID, bt.WaveIndex)
+			}
+			prereqs = append(prereqs, p)
+		}
+		sort.Strings(prereqs)
+		adj[d.TenantID] = prereqs
+	}
+
+	// 环检测：三色 DFS。成环的依赖永远无法全部满足，必须在创建时拒绝。
+	const (
+		white = iota // 未访问
+		gray         // 在当前搜索路径上
+		black        // 已完成
+	)
+	color := make(map[string]int, len(adj))
+	var visit func(t string) error
+	visit = func(t string) error {
+		switch color[t] {
+		case gray:
+			return fmt.Errorf("%w: dependency cycle involving tenant %q", ErrInvalidDependency, t)
+		case black:
+			return nil
+		}
+		color[t] = gray
+		for _, p := range adj[t] {
+			if err := visit(p); err != nil {
+				return err
+			}
+		}
+		color[t] = black
+		return nil
+	}
+	for t := range adj {
+		if err := visit(t); err != nil {
+			return err
+		}
+	}
+
+	for t, prereqs := range adj {
+		tenants[t].DependsOn = prereqs
+	}
+	return nil
 }
 
 // ResumeBatch 恢复被暂停的批次，reason 记入审计。若失败租户数仍超过阈值，
@@ -348,8 +434,17 @@ func (s *Service) checkBatchClaimGate(ctx context.Context, e *Execution) error {
 		// 失败待人工处理：租约窗口过后也不能自行重新领取，必须先重试。
 		return fmt.Errorf("%w: tenant %q awaits retry or removal", ErrTenantFailed, e.TenantID)
 	}
+	if bt.Status == TenantBlocked {
+		// 管理员显式阻断：阻断是最终决定，之后即使前置成功也不能领取。
+		return fmt.Errorf("%w: tenant %q: %s", ErrTenantBlocked, e.TenantID, bt.BlockReason)
+	}
 	if bt.WaveIndex >= len(b.Waves) || !b.Waves[bt.WaveIndex].Started {
 		return fmt.Errorf("%w: tenant %q is in wave %d, current wave %d", ErrWaveNotOpen, e.TenantID, bt.WaveIndex, b.CurrentWave)
+	}
+	if len(bt.DependsOn) > 0 && !bt.DepsOpen {
+		// 依赖闸门未开启：前置租户尚未全部达到允许的完成状态。
+		// 闸门只由 reconcile 在同一批次 revision 的 CAS 内开启，且只开一次。
+		return fmt.Errorf("%w: tenant %q waits for prerequisites %v", ErrDependencyNotSatisfied, e.TenantID, bt.DependsOn)
 	}
 	return nil
 }
@@ -388,6 +483,11 @@ func (s *Service) reconcileBatch(ctx context.Context, batchID string) error {
 		}
 
 		changed := s.syncTenantStates(ctx, &b, execByTenant, now)
+		// 依赖闸门与租户结算在同一批次 revision 的 CAS 内评估：闸门只能依据
+		// 本次 revision 中已结算的前置状态开启，旧观察/旧回执不会越过闸门。
+		if s.syncDependencyGates(&b, now) {
+			changed = true
+		}
 
 		decision := "none"
 		startedWave := -1
@@ -511,6 +611,7 @@ func (s *Service) syncTenantStates(_ context.Context, b *Batch, execByTenant map
 		case StateSucceeded:
 			bt.Status = TenantSucceeded
 			bt.Settled = true
+			bt.ObservedRevision = ex.Revision
 			b.appendEvent(BatchEventTenantSucceeded, "tenant migration succeeded", id, bt.WaveIndex, now)
 			changed = true
 		case StateFailed:
@@ -519,15 +620,49 @@ func (s *Service) syncTenantStates(_ context.Context, b *Batch, execByTenant map
 			bt.Status = TenantFailed
 			bt.Settled = true
 			bt.LastFailure = ex.LastError
+			bt.ObservedRevision = ex.Revision
 			b.appendEvent(BatchEventTenantFailed, failureReason(ex.LastError), id, bt.WaveIndex, now)
 			changed = true
 		case StateRolledBack:
 			bt.Status = TenantFailed
 			bt.Settled = true
 			bt.LastFailure = "execution rolled back to " + string(ex.RollbackUntil)
+			bt.ObservedRevision = ex.Revision
 			b.appendEvent(BatchEventTenantFailed, bt.LastFailure, id, bt.WaveIndex, now)
 			changed = true
 		}
+	}
+	return changed
+}
+
+// syncDependencyGates 依据本次批次 revision 中各前置租户的已结算状态开启依赖
+// 闸门。前置达到允许的完成状态（succeeded，或被管理员显式移出）即视为满足；
+// 失败、阻断、在途、未开始都不算。闸门标记 DepsOpen 单调持久化：开启事件恰好
+// 记录一次，重复收敛、重复 Sweep 与崩溃恢复都不会重复开启。已被管理员阻断的
+// 租户已结算，永远不会在这里被重新标成可运行。
+func (s *Service) syncDependencyGates(b *Batch, now time.Time) bool {
+	changed := false
+	for _, id := range b.TenantIDs {
+		bt := b.Tenants[id]
+		if len(bt.DependsOn) == 0 || bt.DepsOpen || bt.Status.settled() {
+			continue
+		}
+		satisfied := true
+		for _, pre := range bt.DependsOn {
+			st := b.Tenants[pre].Status
+			if st != TenantSucceeded && st != TenantRemoved {
+				satisfied = false
+				break
+			}
+		}
+		if !satisfied {
+			continue
+		}
+		bt.DepsOpen = true
+		b.appendEvent(BatchEventDepsGateOpened,
+			fmt.Sprintf("all prerequisites of tenant %s settled (succeeded or removed)", id),
+			id, bt.WaveIndex, now)
+		changed = true
 	}
 	return changed
 }

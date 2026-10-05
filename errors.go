@@ -71,4 +71,13 @@ var (
 	ErrTenantFailed = errors.New("tenant is awaiting retry or removal")
 	// ErrBatchFailureThreshold 失败租户数已超过允许阈值，批次自动暂停。
 	ErrBatchFailureThreshold = errors.New("batch failure threshold exceeded")
+
+	// ErrInvalidDependency 依赖定义不合法（前置不在批次内、自依赖、重复、
+	// 成环，或前置位于比依赖者更晚的波次导致永远无法满足）。
+	ErrInvalidDependency = errors.New("invalid tenant dependency")
+	// ErrDependencyNotSatisfied 租户的前置租户尚未全部达到允许的完成状态，
+	// 依赖闸门未开启，不能领取步骤。
+	ErrDependencyNotSatisfied = errors.New("tenant dependencies are not satisfied")
+	// ErrTenantBlocked 租户已被管理员显式阻断，不能领取步骤。
+	ErrTenantBlocked = errors.New("tenant is blocked by admin decision")
 )
